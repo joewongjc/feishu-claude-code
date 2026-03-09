@@ -70,70 +70,90 @@ async def run_claude(
             else:
                 on_tool_use(name, inp)
 
-    async for raw_line in proc.stdout:
-        line = raw_line.decode("utf-8", errors="replace").strip()
-        if not line:
-            continue
+    # 空闲超时：每次收到数据重置计时，长任务不会被误杀
+    IDLE_TIMEOUT = 300  # 5 分钟无任何输出视为挂死
 
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    try:
+        while True:
+            try:
+                raw_line = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=IDLE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise RuntimeError(
+                    f"Claude 执行超时（{IDLE_TIMEOUT}秒无输出），已终止进程"
+                )
 
-        event_type = data.get("type")
+            if not raw_line:  # EOF
+                break
 
-        if event_type == "system":
-            sid = data.get("session_id")
-            if sid:
-                new_session_id = sid
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
 
-        elif event_type == "stream_event":
-            evt = data.get("event", {})
-            evt_type = evt.get("type")
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-            if evt_type == "content_block_delta":
-                delta = evt.get("delta", {})
-                delta_type = delta.get("type")
+            event_type = data.get("type")
 
-                if delta_type == "text_delta":
-                    chunk = delta.get("text", "")
-                    if chunk:
-                        full_text += chunk
-                        if on_text_chunk:
-                            if asyncio.iscoroutinefunction(on_text_chunk):
-                                await on_text_chunk(chunk)
-                            else:
-                                on_text_chunk(chunk)
+            if event_type == "system":
+                sid = data.get("session_id")
+                if sid:
+                    new_session_id = sid
 
-                elif delta_type == "input_json_delta":
-                    # 积累 tool_use 的 input JSON 片段
-                    pending_tool_input_json += delta.get("partial_json", "")
+            elif event_type == "stream_event":
+                evt = data.get("event", {})
+                evt_type = evt.get("type")
 
-            elif evt_type == "content_block_start":
-                block = evt.get("content_block", {})
-                if block.get("type") == "tool_use":
-                    pending_tool_name = block.get("name", "")
+                if evt_type == "content_block_delta":
+                    delta = evt.get("delta", {})
+                    delta_type = delta.get("type")
+
+                    if delta_type == "text_delta":
+                        chunk = delta.get("text", "")
+                        if chunk:
+                            full_text += chunk
+                            if on_text_chunk:
+                                if asyncio.iscoroutinefunction(on_text_chunk):
+                                    await on_text_chunk(chunk)
+                                else:
+                                    on_text_chunk(chunk)
+
+                    elif delta_type == "input_json_delta":
+                        # 积累 tool_use 的 input JSON 片段
+                        pending_tool_input_json += delta.get("partial_json", "")
+
+                elif evt_type == "content_block_start":
+                    block = evt.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        pending_tool_name = block.get("name", "")
+                        pending_tool_input_json = ""
+                        # 立即触发一次回调（name 已知，input 还空），用于显示进度
+                        await _fire_tool_use(pending_tool_name, {})
+
+                elif evt_type == "content_block_stop":
+                    # tool_use block 结束，input 已完整，再触发一次带完整参数的回调
+                    if pending_tool_name and pending_tool_input_json:
+                        try:
+                            inp = json.loads(pending_tool_input_json)
+                        except json.JSONDecodeError:
+                            inp = {}
+                        await _fire_tool_use(pending_tool_name, inp)
+                    pending_tool_name = ""
                     pending_tool_input_json = ""
-                    # 立即触发一次回调（name 已知，input 还空），用于显示进度
-                    await _fire_tool_use(pending_tool_name, {})
 
-            elif evt_type == "content_block_stop":
-                # tool_use block 结束，input 已完整，再触发一次带完整参数的回调
-                if pending_tool_name and pending_tool_input_json:
-                    try:
-                        inp = json.loads(pending_tool_input_json)
-                    except json.JSONDecodeError:
-                        inp = {}
-                    await _fire_tool_use(pending_tool_name, inp)
-                pending_tool_name = ""
-                pending_tool_input_json = ""
-
-        elif event_type == "result":
-            sid = data.get("session_id")
-            if sid:
-                new_session_id = sid
-            if not full_text:
-                full_text = data.get("result", "")
+            elif event_type == "result":
+                sid = data.get("session_id")
+                if sid:
+                    new_session_id = sid
+                if not full_text:
+                    full_text = data.get("result", "")
+    except RuntimeError:
+        raise  # 重新抛出超时异常
 
     stderr_output = await proc.stderr.read()
     await proc.wait()

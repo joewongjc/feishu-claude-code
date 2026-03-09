@@ -291,8 +291,10 @@ class SessionStore:
         return {}
 
     def _save(self):
-        with open(SESSIONS_FILE, "w") as f:
+        tmp = SESSIONS_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, SESSIONS_FILE)  # 原子操作，崩溃时不会截断原文件
 
     def _dedup_all_histories(self):
         """启动时清理所有用户 history 中的重复 session_id"""
@@ -406,6 +408,7 @@ class SessionStore:
             "session_id": None,
             "model": cur.get("model", DEFAULT_MODEL),
             "cwd": cur.get("cwd", DEFAULT_CWD),
+            "permission_mode": cur.get("permission_mode", PERMISSION_MODE),
             "started_at": datetime.now().isoformat(),
             "preview": "",
         }
