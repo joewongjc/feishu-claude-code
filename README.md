@@ -25,12 +25,36 @@
 | `/model opus` | 切换模型 (opus / sonnet / haiku) |
 | `/status` | 当前 session 信息 |
 | `/cd ~/project` | 切换工作目录 |
+| `/ls` | 查看当前工作目录内容 |
+| `/ls src` | 查看当前工作目录下某个子目录 |
+| `/ws save 项目A ~/project-a` | 保存命名工作空间 |
+| `/ws use 项目A` | 将当前群组/私聊绑定到某个工作空间 |
 | `/usage` | 查看 Claude Max 用量 (macOS) |
 | `/skills` | 列出 Claude Skills |
 | `/mcp` | 列出 MCP Servers |
 | `/mode bypass` | 切换权限模式 |
 | `/help` | 帮助 |
 | `/commit` 等 | 透传给 Claude CLI Skills |
+
+## 迁移指南（现有用户）
+
+如果你从旧版本升级，需要迁移 session 数据以支持群组功能：
+
+```bash
+# 运行迁移脚本（会自动备份）
+python migrate_sessions.py
+
+# 如果出现问题，可以回滚：
+cp ~/.feishu-claude/sessions.json.backup.YYYYMMDD_HHMMSS ~/.feishu-claude/sessions.json
+```
+
+迁移脚本会：
+- 自动备份原数据
+- 将数据迁移到新格式（支持群组隔离）
+- 验证迁移完整性
+- 提供回滚指令
+
+**注意**：迁移后，你的私聊 session 会继续正常工作，无需任何操作。
 
 ## 架构
 
@@ -54,6 +78,8 @@
 - **工具调用进度** - 实时显示 Claude 正在读文件、执行命令等操作
 - **看门狗自愈** - 4 小时自动重启，防止 WebSocket 假死
 - **多用户隔离** - 每个飞书用户独立 session，互不干扰
+- **群组工作空间绑定** - 不同群组可长期绑定不同项目目录，切群即切项目
+- **多群组并发** - 同一用户在多个群组同时调用 Claude，互不阻塞
 
 ---
 

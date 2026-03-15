@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import subprocess
@@ -268,16 +269,25 @@ SESSIONS_FILE = os.path.join(SESSIONS_DIR, "sessions.json")
 
 
 class Session:
-    def __init__(self, session_id: Optional[str], model: str, cwd: str, permission_mode: str):
+    def __init__(
+        self,
+        session_id: Optional[str],
+        model: str,
+        cwd: str,
+        permission_mode: str,
+        workspace: str = "",
+    ):
         self.session_id = session_id
         self.model = model
         self.cwd = cwd
         self.permission_mode = permission_mode
+        self.workspace = workspace
 
 
 class SessionStore:
     def __init__(self):
         os.makedirs(SESSIONS_DIR, exist_ok=True)
+        self._save_lock = asyncio.Lock()  # 保护 _save() 的全局锁
         self._data: dict = self._load()
         self._dedup_all_histories()
 
@@ -294,80 +304,136 @@ class SessionStore:
         with open(SESSIONS_FILE, "w") as f:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
 
+    async def _save_async(self):
+        """异步保存，使用锁保护并发写入"""
+        async with self._save_lock:
+            with open(SESSIONS_FILE, "w") as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+
     def _dedup_all_histories(self):
         """启动时清理所有用户 history 中的重复 session_id"""
         changed = False
-        for user_id, user in self._data.items():
-            history = user.get("history", [])
-            seen = set()
-            cleaned = []
-            # 倒序遍历，保留每个 session_id 最后出现的那条
-            for h in reversed(history):
-                sid = h.get("session_id")
-                if sid and sid not in seen:
-                    seen.add(sid)
-                    cleaned.append(h)
-            cleaned.reverse()
-            if len(cleaned) != len(history):
-                user["history"] = cleaned
-                changed = True
+        for user in self._data.values():
+            for chat_data in user.values():
+                if not isinstance(chat_data, dict) or "history" not in chat_data:
+                    continue
+                history = chat_data.get("history", [])
+                seen = set()
+                cleaned = []
+                # 倒序遍历，保留每个 session_id 最后出现的那条
+                for h in reversed(history):
+                    sid = h.get("session_id")
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        cleaned.append(h)
+                cleaned.reverse()
+                if len(cleaned) != len(history):
+                    chat_data["history"] = cleaned
+                    changed = True
         if changed:
-            self._save()
+            asyncio.run(self._save_async())
 
     def _user(self, user_id: str) -> dict:
-        return self._data.setdefault(user_id, {
-            "current": {
-                "session_id": None,
-                "model": DEFAULT_MODEL,
-                "cwd": DEFAULT_CWD,
-                "permission_mode": PERMISSION_MODE,
-                "started_at": datetime.now().isoformat(),
-                "preview": "",
-            },
-            "history": [],
-        })
+        return self._data.setdefault(user_id, {})
+
+    def _default_current(self) -> dict:
+        return {
+            "session_id": None,
+            "model": DEFAULT_MODEL,
+            "cwd": DEFAULT_CWD,
+            "permission_mode": PERMISSION_MODE,
+            "started_at": datetime.now().isoformat(),
+            "preview": "",
+            "workspace": "",
+        }
+
+    def _normalize_chat_key(self, user_id: str, chat_id: str) -> str:
+        return "private" if chat_id == user_id else chat_id
+
+    def _ensure_current_defaults(self, current: dict) -> bool:
+        changed = False
+        defaults = self._default_current()
+        for key, value in defaults.items():
+            if key not in current:
+                current[key] = value
+                changed = True
+        return changed
+
+    async def _ensure_chat_data(self, user_id: str, chat_id: str) -> dict:
+        user = self._user(user_id)
+        chat_key = self._normalize_chat_key(user_id, chat_id)
+        changed = False
+
+        if chat_key not in user:
+            # 兼容旧结构：首次访问私聊时把顶层 current/history 迁入 private。
+            if chat_key == "private" and isinstance(user.get("current"), dict):
+                user[chat_key] = {
+                    "current": user.pop("current"),
+                    "history": user.pop("history", []),
+                }
+            else:
+                user[chat_key] = {
+                    "current": self._default_current(),
+                    "history": [],
+                }
+            changed = True
+
+        chat_data = user[chat_key]
+        if self._ensure_current_defaults(chat_data.setdefault("current", self._default_current())):
+            changed = True
+        if "history" not in chat_data:
+            chat_data["history"] = []
+            changed = True
+
+        if changed:
+            await self._save_async()
+
+        return chat_data
 
     def get_summary(self, user_id: str, session_id: str) -> str:
         """获取缓存的摘要"""
         return self._user(user_id).get("summaries", {}).get(session_id, "")
 
-    def batch_set_summaries(self, user_id: str, summaries: dict):
+    async def batch_set_summaries(self, user_id: str, summaries: dict):
         """批量缓存摘要并保存"""
         user = self._user(user_id)
         user.setdefault("summaries", {}).update(summaries)
-        self._save()
+        await self._save_async()
 
-    def get_current(self, user_id: str) -> Session:
-        cur = self._user(user_id)["current"]
+    async def get_current(self, user_id: str, chat_id: str) -> Session:
+        """Get current session config for a specific chat"""
+        cur = await self.get_current_raw(user_id, chat_id)
         return Session(
             session_id=cur.get("session_id"),
             model=cur.get("model", DEFAULT_MODEL),
             cwd=cur.get("cwd", DEFAULT_CWD),
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
+            workspace=cur.get("workspace", ""),
         )
 
-    def on_claude_response(self, user_id: str, new_session_id: str, first_message: str):
+    async def on_claude_response(self, user_id: str, chat_id: str, new_session_id: str, first_message: str):
         """Claude 回复后用返回的 session_id 更新状态"""
-        user = self._user(user_id)
-        cur = user["current"]
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        cur = chat_data["current"]
         old_id = cur.get("session_id")
 
         if old_id and old_id != new_session_id:
             # 归档旧 session（先去重，避免同一 session_id 重复出现）
-            user["history"] = [h for h in user["history"] if h["session_id"] != old_id]
-            user["history"].append({
+            chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_id]
+            chat_data["history"].append({
                 "session_id": old_id,
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })
-            user["history"] = user["history"][-20:]
+            chat_data["history"] = chat_data["history"][-20:]
             cur["started_at"] = datetime.now().isoformat()
             # 为归档的 session 生成摘要（best-effort）
-            if not user.get("summaries", {}).get(old_id):
+            summaries = self._data[user_id].get("summaries", {})
+            if not summaries.get(old_id):
                 try:
                     summary = generate_summary(old_id)
                     if summary:
-                        user.setdefault("summaries", {})[old_id] = summary
+                        self._data[user_id].setdefault("summaries", {})[old_id] = summary
                         _write_custom_title(old_id, summary)
                 except Exception:
                     pass
@@ -375,59 +441,80 @@ class SessionStore:
         cur["session_id"] = new_session_id
         if not cur.get("preview"):
             cur["preview"] = _clean_preview(first_message)[:40]
-        self._save()
+        await self._save_async()
 
-    def new_session(self, user_id: str) -> str:
-        """开始新 session，归档旧的并返回旧 session 的标题（空字符串表示无旧 session）"""
-        user = self._user(user_id)
-        cur = user["current"]
+    async def new_session(self, user_id: str, chat_id: str) -> str:
+        """Start a new session for a specific chat, return old session title"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        cur = chat_data["current"]
         old_title = ""
+
         if cur.get("session_id"):
             old_id = cur["session_id"]
-            # 归档当前 session（先去重）
-            user["history"] = [h for h in user["history"] if h["session_id"] != old_id]
-            user["history"].append({
+            # Archive current session (dedup first)
+            chat_data["history"] = [h for h in chat_data.get("history", []) if h["session_id"] != old_id]
+            chat_data["history"].append({
                 "session_id": old_id,
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })
-            user["history"] = user["history"][-20:]
-            # 获取摘要：优先缓存，否则生成
-            old_title = user.get("summaries", {}).get(old_id, "")
+            chat_data["history"] = chat_data["history"][-20:]
+
+            # Get summary: prefer cached, otherwise generate
+            summaries = self._data[user_id].get("summaries", {})
+            old_title = summaries.get(old_id, "")
             if not old_title:
                 try:
                     old_title = generate_summary(old_id)
                     if old_title:
-                        user.setdefault("summaries", {})[old_id] = old_title
+                        self._data[user_id].setdefault("summaries", {})[old_id] = old_title
                         _write_custom_title(old_id, old_title)
                 except Exception:
                     old_title = ""
-        user["current"] = {
+
+        # Create new session
+        chat_data["current"] = {
             "session_id": None,
             "model": cur.get("model", DEFAULT_MODEL),
             "cwd": cur.get("cwd", DEFAULT_CWD),
+            "permission_mode": cur.get("permission_mode", PERMISSION_MODE),
             "started_at": datetime.now().isoformat(),
             "preview": "",
+            "workspace": cur.get("workspace", ""),
         }
-        self._save()
+        await self._save_async()
         return old_title
 
-    def set_model(self, user_id: str, model: str):
-        self._user(user_id)["current"]["model"] = model
-        self._save()
+    async def set_model(self, user_id: str, chat_id: str, model: str):
+        """Set model for a specific chat"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["model"] = model
+        await self._save_async()
 
-    def set_cwd(self, user_id: str, cwd: str):
-        self._user(user_id)["current"]["cwd"] = cwd
-        self._save()
+    async def set_cwd(self, user_id: str, chat_id: str, cwd: str, workspace_name: Optional[str] = None):
+        """Set working directory for a specific chat"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["cwd"] = cwd
+        chat_data["current"]["workspace"] = workspace_name or ""
+        await self._save_async()
 
-    def set_permission_mode(self, user_id: str, mode: str):
-        self._user(user_id)["current"]["permission_mode"] = mode
-        self._save()
+    async def set_permission_mode(self, user_id: str, chat_id: str, mode: str):
+        """Set permission mode for a specific chat"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["permission_mode"] = mode
+        await self._save_async()
 
-    def resume_session(self, user_id: str, index_or_id: str) -> tuple[Optional[str], str]:
+    async def resume_session(self, user_id: str, chat_id: str, index_or_id: str) -> tuple[Optional[str], str]:
         """按序号（1-based）或 session_id 恢复 session，返回 (session_id, old_title)"""
-        user = self._user(user_id)
-        history = user["history"]
+        if user_id not in self._data:
+            return None, ""
+
+        chat_key = self._normalize_chat_key(user_id, chat_id)
+        if chat_key not in self._data[user_id]:
+            return None, ""
+
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        history = chat_data.get("history", [])
 
         try:
             idx = int(index_or_id) - 1
@@ -439,24 +526,25 @@ class SessionStore:
             session_id = index_or_id
 
         # 归档 outgoing session（如果有且不是同一个）
-        cur = user["current"]
+        cur = chat_data["current"]
         old_id = cur.get("session_id")
         old_title = ""
         if old_id and old_id != session_id:
-            user["history"] = [h for h in user["history"] if h["session_id"] != old_id]
-            user["history"].append({
+            chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_id]
+            chat_data["history"].append({
                 "session_id": old_id,
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })
-            user["history"] = user["history"][-20:]
+            chat_data["history"] = chat_data["history"][-20:]
             # 获取摘要：优先缓存，否则生成
-            old_title = user.get("summaries", {}).get(old_id, "")
+            summaries = self._data[user_id].get("summaries", {})
+            old_title = summaries.get(old_id, "")
             if not old_title:
                 try:
                     old_title = generate_summary(old_id)
                     if old_title:
-                        user.setdefault("summaries", {})[old_id] = old_title
+                        self._data[user_id].setdefault("summaries", {})[old_id] = old_title
                         _write_custom_title(old_id, old_title)
                 except Exception:
                     old_title = ""
@@ -464,7 +552,7 @@ class SessionStore:
         # 从 history 中找回原始 preview 和 started_at
         original_preview = ""
         original_started = ""
-        for h in user["history"]:
+        for h in chat_data["history"]:
             if h["session_id"] == session_id:
                 original_preview = h.get("preview", "")
                 original_started = h.get("started_at", "")
@@ -472,11 +560,57 @@ class SessionStore:
         cur["session_id"] = session_id
         cur["preview"] = original_preview
         cur["started_at"] = original_started or datetime.now().isoformat()
-        self._save()
+        await self._save_async()
         return session_id, old_title
 
-    def list_sessions(self, user_id: str) -> list:
-        return list(reversed(self._user(user_id)["history"]))
+    async def list_sessions(self, user_id: str, chat_id: str) -> list:
+        """List all sessions for a specific chat"""
+        if user_id not in self._data:
+            return []
 
-    def get_current_raw(self, user_id: str) -> dict:
-        return self._user(user_id)["current"]
+        chat_key = self._normalize_chat_key(user_id, chat_id)
+        if chat_key not in self._data[user_id]:
+            return []
+
+        return list(reversed((await self._ensure_chat_data(user_id, chat_id)).get("history", [])))
+
+    def list_workspaces(self, user_id: str) -> dict[str, str]:
+        """List saved workspaces for a user"""
+        return dict(sorted(self._user(user_id).get("workspaces", {}).items()))
+
+    async def save_workspace(self, user_id: str, name: str, cwd: str):
+        """Save or update a named workspace for a user"""
+        user = self._user(user_id)
+        user.setdefault("workspaces", {})[name] = cwd
+        await self._save_async()
+
+    async def delete_workspace(self, user_id: str, name: str) -> bool:
+        """Delete a named workspace and clear active bindings that reference it"""
+        user = self._user(user_id)
+        workspaces = user.setdefault("workspaces", {})
+        if name not in workspaces:
+            return False
+
+        del workspaces[name]
+        for chat_data in user.values():
+            if not isinstance(chat_data, dict) or "current" not in chat_data:
+                continue
+            if chat_data["current"].get("workspace") == name:
+                chat_data["current"]["workspace"] = ""
+        await self._save_async()
+        return True
+
+    async def bind_workspace(self, user_id: str, chat_id: str, name: str) -> Optional[str]:
+        """Bind a saved workspace to the current chat"""
+        path = self._user(user_id).get("workspaces", {}).get(name)
+        if not path:
+            return None
+        await self.set_cwd(user_id, chat_id, path, workspace_name=name)
+        return path
+
+    async def get_current_raw(self, user_id: str, chat_id: str = None) -> dict:
+        """Get raw current session data for a specific chat"""
+        if chat_id is None:
+            chat_id = user_id
+
+        return (await self._ensure_chat_data(user_id, chat_id))["current"]
