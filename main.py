@@ -57,8 +57,8 @@ lark_client = lark.Client.builder() \
 feishu = FeishuClient(lark_client, app_id=config.FEISHU_APP_ID, app_secret=config.FEISHU_APP_SECRET)
 store = SessionStore()
 
-# per-user 消息队列锁，保证同一用户的消息串行处理，避免并发创建多个 session
-_user_locks: dict[str, asyncio.Lock] = {}
+# per-chat 消息队列锁，保证同一群组的消息串行处理，允许不同群组并发处理
+_chat_locks: dict[str, asyncio.Lock] = {}
 
 
 # ── 核心消息处理（async）─────────────────────────────────────
@@ -100,10 +100,10 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
     user_id, chat_id, is_group = extract_chat_info(event)
     print(f"[Chat Info] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
 
-    # 获取该用户的队列锁，保证消息串行处理
-    if user_id not in _user_locks:
-        _user_locks[user_id] = asyncio.Lock()
-    lock = _user_locks[user_id]
+    # 获取该群组的队列锁，保证同一群组消息串行处理，不同群组可并发
+    if chat_id not in _chat_locks:
+        _chat_locks[chat_id] = asyncio.Lock()
+    lock = _chat_locks[chat_id]
 
     async with lock:
         try:
@@ -209,7 +209,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
         )
     try:
         print(f"[run_claude] 开始调用...", flush=True)
-        full_text, new_session_id = await run_claude(
+        full_text, new_session_id, used_fresh_session_fallback = await run_claude(
             message=claude_msg,
             session_id=session.session_id,
             model=session.model,
@@ -228,6 +228,11 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
 
     # 3. 一次性更新卡片为完整内容
     final = full_text or "（无输出）"
+    if used_fresh_session_fallback:
+        final = (
+            "⚠️ 检测到工作目录已变化，旧会话无法继续。"
+            "本次已自动切换到新 session。\n\n" + final
+        )
     try:
         await feishu.update_card(card_msg_id, final)
     except Exception as e:
