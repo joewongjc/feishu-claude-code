@@ -15,6 +15,7 @@ def _make_event(text: str, open_id: str = "ou_test_user"):
     message = SimpleNamespace(
         message_type="text",
         chat_type="p2p",
+        chat_id="oc_test_chat",
         content=json.dumps({"text": text}),
         message_id="om_test_message",
     )
@@ -24,7 +25,7 @@ def _make_event(text: str, open_id: str = "ou_test_user"):
 
 class HandleMessageQueueTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        main._user_locks.clear()
+        main._chat_locks.clear()
 
     async def test_queued_message_gets_immediate_acknowledgement(self):
         event = _make_event("second message")
@@ -32,7 +33,7 @@ class HandleMessageQueueTests(IsolatedAsyncioTestCase):
 
         lock = asyncio.Lock()
         await lock.acquire()
-        main._user_locks[sender_open_id] = lock
+        main._chat_locks[sender_open_id] = lock
 
         ack_mock = AsyncMock()
         process_mock = AsyncMock()

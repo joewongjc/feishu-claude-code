@@ -17,11 +17,8 @@ class _FakeStdin:
 
 
 class _FakeStdout:
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        raise StopAsyncIteration
+    async def readline(self):
+        return b""
 
 
 class _FakeStderr:
