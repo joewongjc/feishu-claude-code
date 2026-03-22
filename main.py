@@ -28,7 +28,8 @@ from run_control import ActiveRun, ActiveRunRegistry, stop_run
 
 # ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
 
-MAX_UPTIME = 4 * 3600   # 最长运行 4 小时后主动重启
+MAX_UPTIME = int(os.getenv("MAX_UPTIME_SECONDS", "0"))
+MAX_IDLE_RESTART = int(os.getenv("MAX_IDLE_RESTART_SECONDS", "7200"))
 _start_time = time.time()
 _last_event = time.time()
 
@@ -40,8 +41,12 @@ def _watchdog():
         uptime = time.time() - _start_time
         idle = time.time() - _last_event
 
-        if uptime > MAX_UPTIME:
+        if MAX_UPTIME > 0 and uptime > MAX_UPTIME:
             print(f"[watchdog] 运行 {uptime/3600:.1f}h，定时重启刷新连接", flush=True)
+            os._exit(0)
+
+        if MAX_IDLE_RESTART > 0 and idle > MAX_IDLE_RESTART:
+            print(f"[watchdog] 空闲 {idle/60:.0f}min，主动重启刷新连接", flush=True)
             os._exit(0)
 
         print(f"[watchdog] uptime={uptime/3600:.1f}h idle={idle/60:.0f}min", flush=True)
@@ -154,6 +159,9 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
         _chat_locks[chat_id] = asyncio.Lock()
     lock = _chat_locks[chat_id]
 
+    if lock.locked():
+        await _notify_message_queued(user_id, is_group, msg)
+
     async with lock:
         try:
             await _process_message(user_id, chat_id, is_group, msg)
@@ -161,6 +169,18 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
             print(f"[error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
+
+
+async def _notify_message_queued(user_id: str, is_group: bool, msg):
+    """同一会话已有消息处理中时，立即给一条可见回执。"""
+    try:
+        notice = "前一条消息还在处理中，这条我已经收到了，结束后会按顺序继续。"
+        if is_group:
+            await feishu.reply_card(msg.message_id, content=notice, loading=False)
+        else:
+            await feishu.send_text_to_user(user_id, notice)
+    except Exception as e:
+        print(f"[warn] 发送排队提示失败: {type(e).__name__}: {e}", flush=True)
 
 
 async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
@@ -369,11 +389,33 @@ def _format_tool(name: str, inp: dict) -> str:
 def on_message_receive(data: P2ImMessageReceiveV1) -> None:
     """
     飞书 SDK 同步回调。
-    ws.Client 内部运行 asyncio loop，此处用 ensure_future 调度异步任务。
+    ws.Client 内部运行 asyncio loop，此处显式创建后台任务并记录异常。
     """
     global _last_event
     _last_event = time.time()
-    asyncio.ensure_future(handle_message_async(data))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    task = loop.create_task(handle_message_async(data))
+    task.add_done_callback(_log_background_task_result)
+
+
+def _log_background_task_result(task: asyncio.Task):
+    """把后台任务异常打到主日志，避免静默丢失。"""
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        print("[warn] 后台消息任务被取消", flush=True)
+        return
+    except Exception as e:
+        print(f"[error] 读取后台任务结果失败: {type(e).__name__}: {e}", flush=True)
+        return
+
+    if exc is not None:
+        print(f"[error] 后台消息任务异常: {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stdout)
+        sys.stdout.flush()
 
 
 # ── 启动 ──────────────────────────────────────────────────────
