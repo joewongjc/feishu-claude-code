@@ -6,6 +6,7 @@
 import asyncio
 import json
 import os
+import re
 import tempfile
 import time
 from typing import Optional
@@ -21,6 +22,52 @@ from lark_oapi.api.im.v1.model import (
 )
 
 
+_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$"
+)
+
+
+def _split_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _looks_like_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.count("|") >= 2 and not stripped.startswith("```")
+
+
+def _downgrade_markdown_tables(content: str) -> str:
+    """把 Markdown 表格降级成普通文本，避免飞书卡片把它解析成 table。"""
+    lines = content.splitlines()
+    result: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        current = lines[i]
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        if _looks_like_table_row(current) and _TABLE_SEPARATOR_RE.match(next_line.strip()):
+            rows = [_split_table_row(current)]
+            i += 2
+            while i < len(lines) and _looks_like_table_row(lines[i]):
+                rows.append(_split_table_row(lines[i]))
+                i += 1
+
+            if rows:
+                result.append("表格内容：")
+                result.extend(" / ".join(cell for cell in row if cell) for row in rows)
+            continue
+
+        result.append(current)
+        i += 1
+
+    return "\n".join(result)
+
+
 def _card_json(content: str, loading: bool = False) -> str:
     """
     生成卡片 JSON 字符串（Card JSON 2.0）
@@ -32,6 +79,8 @@ def _card_json(content: str, loading: bool = False) -> str:
     if loading:
         elements.append({"tag": "markdown", "content": "⏳ 思考中..."})
     else:
+        content = _downgrade_markdown_tables(content)
+
         # 飞书 markdown 元素长度限制约 3000 字符，保守使用 2800
         MAX_CHUNK_SIZE = 2800
 
@@ -83,7 +132,6 @@ def _card_json(content: str, loading: bool = False) -> str:
                 if i > 0:
                     chunk = f"**（续 {i}）**\n\n{chunk}"
                 elements.append({"tag": "markdown", "content": chunk})
-
     return json.dumps({
         "schema": "2.0",
         "body": {"elements": elements},
