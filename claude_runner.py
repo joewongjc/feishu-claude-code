@@ -35,6 +35,22 @@ async def _fire_callback(cb, *args):
         cb(*args)
 
 
+FORWARDED_ENV_VARS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "API_TIMEOUT_MS",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+)
+
+UNSET_ENV_VARS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+
+
 async def run_claude(
     message: str,
     session_id: Optional[str] = None,
@@ -68,6 +84,12 @@ async def run_claude(
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
+        for key in UNSET_ENV_VARS:
+            env.pop(key, None)
+        for key in FORWARDED_ENV_VARS:
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
