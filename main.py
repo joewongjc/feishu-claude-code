@@ -121,8 +121,6 @@ _COMMAND_MENU = [
     {"text": "🛠 Skills",      "value": {"action": "run_cmd", "cmd": "/skills", "cid": ""}},
     {"text": "🔌 MCP",         "value": {"action": "run_cmd", "cmd": "/mcp", "cid": ""}},
     {"text": "📄 目录",        "value": {"action": "run_cmd", "cmd": "/ls", "cid": ""}},
-    # Claude Skills
-    {"text": "💾 提交代码",    "value": {"action": "reply", "reply": "/commit", "cid": ""}},
     {"text": "❓ 帮助",        "value": {"action": "run_cmd", "cmd": "/help", "cid": ""}},
 ]
 

@@ -212,46 +212,70 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore):
     return "\n".join(lines)
 
 
-def _list_skills() -> str:
-    """扫描 ~/.claude/plugins 目录，列出所有可用的 slash command skills"""
+def _list_skills(chat_id: str = ""):
+    """扫描 ~/.claude/plugins + ~/.claude/skills 目录，返回 dict(text, buttons) 或 str"""
     skills = []
-    if not os.path.isdir(PLUGINS_DIR):
-        return "暂无已安装的 skills。"
-
-    for root, dirs, files in os.walk(PLUGINS_DIR):
-        if os.path.basename(root) != "commands":
-            continue
-        for fname in files:
-            if not fname.endswith(".md"):
+    # 扫描 plugins (旧格式)
+    if os.path.isdir(PLUGINS_DIR):
+        for root, dirs, files in os.walk(PLUGINS_DIR):
+            if os.path.basename(root) != "commands":
                 continue
-            name = fname[:-3]
-            fpath = os.path.join(root, fname)
-            desc = ""
-            try:
-                with open(fpath, encoding="utf-8") as f:
-                    in_frontmatter = False
-                    for line in f:
-                        line = line.strip()
-                        if line == "---" and not in_frontmatter:
-                            in_frontmatter = True
-                            continue
-                        if line == "---" and in_frontmatter:
-                            break
-                        if in_frontmatter and line.startswith("description:"):
-                            desc = line[len("description:"):].strip().strip('"')
-            except OSError:
-                pass
-            skills.append((name, desc))
+            for fname in files:
+                if not fname.endswith(".md"):
+                    continue
+                name = fname[:-3]
+                fpath = os.path.join(root, fname)
+                desc = _read_skill_desc(fpath)
+                skills.append((name, desc))
+
+    # 扫描 skills (新格式)
+    skills_dir = os.path.expanduser("~/.claude/skills")
+    if os.path.isdir(skills_dir):
+        for entry in os.listdir(skills_dir):
+            skill_md = os.path.join(skills_dir, entry, "SKILL.md")
+            if os.path.isfile(skill_md):
+                desc = _read_skill_desc(skill_md)
+                skills.append((entry, desc))
 
     if not skills:
         return "暂无已安装的 skills。"
 
     skills.sort(key=lambda x: x[0])
-    lines = ["🛠 **可用 Skills**（发送 `/名称` 即可调用）\n"]
+    # 去重
+    seen = set()
+    unique = []
     for name, desc in skills:
-        desc_str = f" — {desc}" if desc else ""
-        lines.append(f"• `/{name}`{desc_str}")
-    return "\n".join(lines)
+        if name not in seen:
+            seen.add(name)
+            unique.append((name, desc))
+
+    buttons = [
+        {"text": f"/{name}", "value": {"action": "reply", "reply": f"/{name}", "cid": chat_id}}
+        for name, desc in unique[:15]
+    ]
+    return {
+        "text": f"🛠 **可用 Skills** ({len(unique)} 个)",
+        "buttons": buttons,
+    }
+
+
+def _read_skill_desc(fpath: str) -> str:
+    """从 skill/command 的 md 文件中提取 description"""
+    try:
+        with open(fpath, encoding="utf-8") as f:
+            in_frontmatter = False
+            for line in f:
+                line = line.strip()
+                if line == "---" and not in_frontmatter:
+                    in_frontmatter = True
+                    continue
+                if line == "---" and in_frontmatter:
+                    break
+                if in_frontmatter and line.startswith("description:"):
+                    return line[len("description:"):].strip().strip('"')
+    except OSError:
+        pass
+    return ""
 
 
 def _get_usage() -> str:
@@ -417,32 +441,30 @@ async def _list_directory(user_id: str, chat_id: str, store: SessionStore, args:
     return "\n".join(lines)
 
 
-async def _format_workspace_list(user_id: str, chat_id: str, store: SessionStore) -> str:
+async def _format_workspace_list(user_id: str, chat_id: str, store: SessionStore):
     cur = await store.get_current_raw(user_id, chat_id)
     current_name = cur.get("workspace", "")
     current_cwd = cur.get("cwd", "~")
     workspaces = store.list_workspaces(user_id)
 
     lines = ["🗂 **工作空间**"]
-    lines.append(f"当前绑定：`{current_name}`" if current_name else "当前绑定：（未命名）")
-    lines.append(f"当前目录：`{current_cwd}`")
+    lines.append(f"当前：`{current_name or '（未命名）'}` → `{current_cwd}`")
 
+    buttons = []
     if workspaces:
-        lines.append("")
-        lines.append("已保存：")
         for name, path in workspaces.items():
-            marker = " ← 当前群组" if name == current_name else ""
-            lines.append(f"• `{name}` → `{path}`{marker}")
-    else:
-        lines.append("")
-        lines.append("还没有已保存的工作空间。")
+            marker = " ✓" if name == current_name else ""
+            buttons.append({
+                "text": f"📁 {name}{marker}",
+                "value": {"action": "run_cmd", "cmd": f"/ws use {name}", "cid": chat_id},
+            })
 
-    lines.append("")
-    lines.append("用法：")
-    lines.append("`/ws save 名称 [路径]` 保存工作空间")
-    lines.append("`/ws use 名称` 绑定当前群组到该工作空间")
-    lines.append("`/ws set 路径` 直接设置当前群组目录")
-    lines.append("`/ws remove 名称` 删除已保存的工作空间")
+    if buttons:
+        lines.append(f"已保存 {len(workspaces)} 个，点击切换：")
+        return {"text": "\n".join(lines), "buttons": buttons}
+
+    lines.append("还没有已保存的工作空间。")
+    lines.append("`/ws save 名称 [路径]` 保存")
     return "\n".join(lines)
 
 
@@ -591,7 +613,14 @@ async def handle_command(
     elif cmd == "model":
         if not args:
             cur = await store.get_current(user_id, chat_id)
-            return f"当前模型：`{cur.model}`\n可用：opus / sonnet / haiku 或完整模型 ID"
+            return {
+                "text": f"当前模型：**{cur.model}**",
+                "buttons": [
+                    {"text": "🧠 Opus", "value": {"action": "run_cmd", "cmd": "/model opus", "cid": chat_id}},
+                    {"text": "⚡ Sonnet", "value": {"action": "run_cmd", "cmd": "/model sonnet", "cid": chat_id}},
+                    {"text": "🐇 Haiku", "value": {"action": "run_cmd", "cmd": "/model haiku", "cid": chat_id}},
+                ],
+            }
         model = MODEL_ALIASES.get(args.lower(), args)
         await store.set_model(user_id, chat_id, model)
         return f"✅ 已切换模型为 `{model}`"
@@ -617,14 +646,15 @@ async def handle_command(
     elif cmd == "mode":
         if not args:
             cur = await store.get_current(user_id, chat_id)
-            current_mode = cur.permission_mode
-            lines = [f"当前模式：**{current_mode}** — {VALID_MODES.get(current_mode, '')}\n"]
-            lines.append("**可选模式：**")
-            for mode, desc in VALID_MODES.items():
-                marker = " ← 当前" if mode == current_mode else ""
-                lines.append(f"• `{mode}` — {desc}{marker}")
-            lines.append("\n用 `/mode [模式名]` 切换。")
-            return "\n".join(lines)
+            return {
+                "text": f"当前模式：**{cur.permission_mode}**\n{VALID_MODES.get(cur.permission_mode, '')}",
+                "buttons": [
+                    {"text": "📋 规划", "value": {"action": "set_mode", "mode": "plan", "cid": chat_id}},
+                    {"text": "✏️ 接受编辑", "value": {"action": "set_mode", "mode": "acceptEdits", "cid": chat_id}},
+                    {"text": "🚀 全自动", "value": {"action": "set_mode", "mode": "bypassPermissions", "cid": chat_id}},
+                    {"text": "🔒 需确认", "value": {"action": "set_mode", "mode": "default", "cid": chat_id}},
+                ],
+            }
         mode = MODE_ALIASES.get(args.lower(), args)
         if mode not in VALID_MODES:
             return f"❌ 未知模式：`{args}`\n可选：{', '.join(f'`{m}`' for m in VALID_MODES)}"
@@ -649,7 +679,7 @@ async def handle_command(
         return await _handle_workspace_command(args, user_id, chat_id, store)
 
     elif cmd == "skills":
-        return _list_skills()
+        return _list_skills(chat_id)
 
     elif cmd == "mcp":
         return _list_mcp()
