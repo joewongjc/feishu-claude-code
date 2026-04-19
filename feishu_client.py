@@ -91,10 +91,12 @@ def _card_json(content: str, loading: bool = False) -> str:
 
 
 class FeishuClient:
-    def __init__(self, client: lark.Client, app_id: str = "", app_secret: str = ""):
+    def __init__(self, client: lark.Client, app_id: str = "", app_secret: str = "",
+                 domain: str = "https://open.feishu.cn"):
         self.client = client
         self._app_id = app_id
         self._app_secret = app_secret
+        self._domain = domain.rstrip("/")
 
     async def _retry_with_backoff(self, coro_func, max_retries: int = 3, initial_delay: float = 0.5):
         """
@@ -208,7 +210,7 @@ class FeishuClient:
 
         token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
         token_req = urllib.request.Request(
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            f"{self._domain}/open-apis/auth/v3/tenant_access_token/internal",
             data=token_body,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -216,7 +218,7 @@ class FeishuClient:
         with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
             token = json.loads(r.read())["tenant_access_token"]
 
-        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image"
+        url = f"{self._domain}/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image"
         img_req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
         tmp_path = os.path.join(tempfile.gettempdir(), f"feishu-img-{uuid.uuid4().hex[:8]}.jpg")
         with urllib.request.urlopen(img_req, context=ctx, timeout=15) as r:

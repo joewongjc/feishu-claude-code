@@ -26,6 +26,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 
 import bot_config as config
 from feishu_client import FeishuClient
+from feishu_post import parse_post_content, extract_post_image_keys
 from session_store import SessionStore, generate_summary, _write_custom_title
 from commands import parse_command, handle_command
 from claude_runner import run_claude
@@ -68,10 +69,16 @@ threading.Thread(target=_start_bot_loop, daemon=True, name="bot-loop").start()
 lark_client = lark.Client.builder() \
     .app_id(config.FEISHU_APP_ID) \
     .app_secret(config.FEISHU_APP_SECRET) \
+    .domain(config.LARK_DOMAIN) \
     .log_level(lark.LogLevel.INFO) \
     .build()
 
-feishu = FeishuClient(lark_client, app_id=config.FEISHU_APP_ID, app_secret=config.FEISHU_APP_SECRET)
+feishu = FeishuClient(
+    lark_client,
+    app_id=config.FEISHU_APP_ID,
+    app_secret=config.FEISHU_APP_SECRET,
+    domain=config.LARK_DOMAIN,
+)
 store = SessionStore()
 _active_runs = ActiveRunRegistry()
 
@@ -476,6 +483,44 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
             else:
                 await feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
             return
+
+    elif msg.message_type == "post":
+        post_text = parse_post_content(msg.content).strip()
+        image_keys = extract_post_image_keys(msg.content)
+
+        # 群聊去掉 @mention 占位符（post 文本里也可能混入）
+        if is_group:
+            for mention in (getattr(msg, 'mentions', None) or []):
+                key = getattr(mention, 'key', '')
+                if key:
+                    post_text = post_text.replace(key, '').strip()
+
+        img_paths: list[str] = []
+        for ik in image_keys:
+            try:
+                path = await feishu.download_image(msg.message_id, ik)
+                img_paths.append(path)
+            except Exception as e:
+                print(f"[error] 下载 post 图片失败 key={ik[:8]}...: {e}", flush=True)
+
+        if not post_text and not img_paths:
+            print(f"[post] 空内容，忽略", flush=True)
+            return
+
+        if img_paths:
+            paths_list = "\n".join(f"  - {p}" for p in img_paths)
+            caption = post_text or "（无文字说明）"
+            text = (
+                f"[用户发送了富文本消息，含 {len(img_paths)} 张图片]\n"
+                f"文字内容：{caption}\n"
+                f"图片路径：\n{paths_list}\n"
+                f"请读取并分析这些图片，结合文字回复（中文）。"
+            )
+            img_path = img_paths[0]  # 仅用于日志兼容
+        else:
+            text = post_text
+
+        print(f"[post] text_len={len(post_text)} imgs={len(img_paths)}", flush=True)
 
     else:
         return  # 不支持的消息类型
@@ -1001,6 +1046,7 @@ def _start_ngrok(port):
 
 def main():
     print("🚀 飞书 Claude Bot 启动中...")
+    print(f"   平台        : {config.LARK_PLATFORM} ({config.LARK_DOMAIN})")
     print(f"   App ID      : {config.FEISHU_APP_ID}")
     print(f"   默认模型    : {config.DEFAULT_MODEL}")
     print(f"   默认工作目录: {config.DEFAULT_CWD}")
@@ -1018,12 +1064,14 @@ def main():
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message_receive) \
         .register_p2_card_action_trigger(on_card_action) \
+        .register_p2_im_message_message_read_v1(lambda _e: None) \
         .build()
 
     ws_client = lark.ws.Client(
         config.FEISHU_APP_ID,
         config.FEISHU_APP_SECRET,
         event_handler=handler,
+        domain=config.LARK_DOMAIN,
         log_level=lark.LogLevel.INFO,
     )
 
