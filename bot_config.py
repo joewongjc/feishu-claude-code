@@ -7,6 +7,16 @@ load_dotenv()
 FEISHU_APP_ID = os.environ["FEISHU_APP_ID"]
 FEISHU_APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 
+# 平台选择：feishu（中国版，默认）或 lark（国际版）
+_DOMAIN_MAP = {
+    "feishu": "https://open.feishu.cn",
+    "lark": "https://open.larksuite.com",
+}
+LARK_PLATFORM = os.getenv("LARK_PLATFORM", "feishu").lower()
+if LARK_PLATFORM not in _DOMAIN_MAP:
+    raise ValueError(f"LARK_PLATFORM 必须是 feishu 或 lark，当前: {LARK_PLATFORM}")
+LARK_DOMAIN = _DOMAIN_MAP[LARK_PLATFORM]
+
 CLAUDE_CLI = os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude") or "claude"
 
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-opus-4-6")
