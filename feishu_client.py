@@ -192,20 +192,10 @@ class FeishuClient:
 
         await self._retry_with_backoff(_update, max_retries=3)
 
-    async def download_image(self, message_id: str, image_key: str) -> str:
-        """下载飞书图片到临时文件，返回本地路径（不阻塞事件循环）"""
-        return await asyncio.to_thread(
-            self._download_image_sync, message_id, image_key
-        )
-
-    def _download_image_sync(self, message_id: str, image_key: str) -> str:
-        """同步下载逻辑，在线程池中执行"""
+    def _get_tenant_token_sync(self) -> str:
         import ssl
         import urllib.request
-        import uuid
-
         ctx = ssl.create_default_context()
-
         token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
         token_req = urllib.request.Request(
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
@@ -214,7 +204,21 @@ class FeishuClient:
             method="POST",
         )
         with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
-            token = json.loads(r.read())["tenant_access_token"]
+            return json.loads(r.read())["tenant_access_token"]
+
+    async def download_image(self, message_id: str, image_key: str) -> str:
+        """下载飞书图片到临时文件，返回本地路径（不阻塞事件循环）"""
+        return await asyncio.to_thread(
+            self._download_image_sync, message_id, image_key
+        )
+
+    def _download_image_sync(self, message_id: str, image_key: str) -> str:
+        import ssl
+        import urllib.request
+        import uuid
+
+        ctx = ssl.create_default_context()
+        token = self._get_tenant_token_sync()
 
         url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image"
         img_req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
@@ -225,6 +229,54 @@ class FeishuClient:
                 tmp_path = tmp_path.replace(".jpg", ".png")
             elif "gif" in ct:
                 tmp_path = tmp_path.replace(".jpg", ".gif")
+            with open(tmp_path, "wb") as f:
+                f.write(r.read())
+
+        return tmp_path
+
+    async def download_file(self, message_id: str, file_key: str, file_name: str = "") -> str:
+        """下载飞书文件到临时目录，返回本地路径"""
+        return await asyncio.to_thread(
+            self._download_file_sync, message_id, file_key, file_name
+        )
+
+    def _download_file_sync(self, message_id: str, file_key: str, file_name: str = "") -> str:
+        import ssl
+        import urllib.request
+        import uuid
+
+        ctx = ssl.create_default_context()
+        token = self._get_tenant_token_sync()
+
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        if not file_name:
+            file_name = f"feishu-file-{uuid.uuid4().hex[:8]}"
+        tmp_path = os.path.join(tempfile.gettempdir(), file_name)
+        with urllib.request.urlopen(req, context=ctx, timeout=60) as r:
+            with open(tmp_path, "wb") as f:
+                f.write(r.read())
+
+        return tmp_path
+
+    async def download_audio(self, message_id: str, file_key: str) -> str:
+        """下载飞书音频到临时文件，返回本地路径"""
+        return await asyncio.to_thread(
+            self._download_audio_sync, message_id, file_key
+        )
+
+    def _download_audio_sync(self, message_id: str, file_key: str) -> str:
+        import ssl
+        import urllib.request
+        import uuid
+
+        ctx = ssl.create_default_context()
+        token = self._get_tenant_token_sync()
+
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        tmp_path = os.path.join(tempfile.gettempdir(), f"feishu-audio-{uuid.uuid4().hex[:8]}.opus")
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
             with open(tmp_path, "wb") as f:
                 f.write(r.read())
 

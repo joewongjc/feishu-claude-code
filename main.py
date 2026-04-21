@@ -433,11 +433,77 @@ async def _run_and_display(
             pass
 
 
+async def _send_error(user_id: str, chat_id: str, is_group: bool, msg_id: str, error: str):
+    """统一发送错误提示"""
+    try:
+        if is_group:
+            await feishu.reply_card(msg_id, content=f"❌ {error}", loading=False)
+        else:
+            await feishu.send_text_to_user(user_id, f"❌ {error}")
+    except Exception:
+        pass
+
+
+async def _parse_post_message(msg) -> tuple[str, list[tuple[str, str]]]:
+    """
+    解析富文本(post)消息，提取文字和下载内嵌图片/文件。
+    返回 (text, [(描述, 本地路径), ...])
+    """
+    content = json.loads(msg.content)
+    parts = []
+    downloaded = []
+
+    # post 格式: {"zh_cn": {"title": "...", "content": [[{tag, ...}]]}} 或直接 {"title": ..., "content": ...}
+    post_body = content
+    for lang_key in ("zh_cn", "en_us", "ja_jp"):
+        if lang_key in content:
+            post_body = content[lang_key]
+            break
+
+    title = post_body.get("title", "")
+    if title:
+        parts.append(title)
+
+    paragraphs = post_body.get("content", [])
+    for paragraph in paragraphs:
+        line_parts = []
+        for element in paragraph:
+            tag = element.get("tag", "")
+            if tag == "text":
+                line_parts.append(element.get("text", ""))
+            elif tag == "a":
+                href = element.get("href", "")
+                link_text = element.get("text", href)
+                line_parts.append(f"[{link_text}]({href})")
+            elif tag == "at":
+                line_parts.append(f"@{element.get('user_name', element.get('user_id', ''))}")
+            elif tag == "img":
+                image_key = element.get("image_key", "")
+                if image_key:
+                    try:
+                        img_path = await feishu.download_image(msg.message_id, image_key)
+                        downloaded.append(("图片", img_path))
+                    except Exception as e:
+                        print(f"[warn] 富文本内图片下载失败: {e}", flush=True)
+            elif tag == "media":
+                file_key = element.get("file_key", "")
+                if file_key:
+                    try:
+                        file_name = element.get("file_name", "media_file")
+                        media_path = await feishu.download_file(msg.message_id, file_key, file_name)
+                        downloaded.append((f"媒体({file_name})", media_path))
+                    except Exception as e:
+                        print(f"[warn] 富文本内媒体下载失败: {e}", flush=True)
+        if line_parts:
+            parts.append("".join(line_parts))
+
+    return "\n".join(parts), downloaded
+
+
 async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
     """实际处理消息的逻辑，在 per-chat lock 保护下执行"""
-    print(f"[处理消息] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
+    print(f"[处理消息] user={user_id[:8]}... chat={chat_id[:8]}... type={msg.message_type} is_group={is_group}", flush=True)
     text = ""
-    img_path = None
 
     if msg.message_type == "text":
         try:
@@ -468,17 +534,79 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
             text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
         except Exception as e:
             print(f"[error] 下载图片失败: {e}")
-            if is_group:
-                try:
-                    await feishu.reply_card(msg.message_id, content=f"❌ 下载图片失败：{e}", loading=False)
-                except Exception:
-                    pass
-            else:
-                await feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
+            await _send_error(user_id, chat_id, is_group, msg.message_id, f"下载图片失败：{e}")
             return
 
+    elif msg.message_type == "file":
+        try:
+            content = json.loads(msg.content)
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "")
+            if not file_key:
+                return
+            file_path = await feishu.download_file(msg.message_id, file_key, file_name)
+            text = f"[用户发送了一个文件，文件名：{file_name}，已下载到路径：{file_path}，请读取并处理这个文件，直接回复用中文]"
+            print(f"[文件] {file_name} → {file_path}", flush=True)
+        except Exception as e:
+            print(f"[error] 下载文件失败: {e}")
+            await _send_error(user_id, chat_id, is_group, msg.message_id, f"下载文件失败：{e}")
+            return
+
+    elif msg.message_type == "audio":
+        try:
+            content = json.loads(msg.content)
+            file_key = content.get("file_key", "")
+            if not file_key:
+                return
+            audio_path = await feishu.download_audio(msg.message_id, file_key)
+            text = f"[用户发送了一条语音消息，已下载到路径：{audio_path}，这是音频文件，请告知用户你已收到语音但暂时无法直接播放音频，建议用户用文字描述]"
+            print(f"[语音] → {audio_path}", flush=True)
+        except Exception as e:
+            print(f"[error] 下载语音失败: {e}")
+            await _send_error(user_id, chat_id, is_group, msg.message_id, f"下载语音失败：{e}")
+            return
+
+    elif msg.message_type in ("media", "video"):
+        try:
+            content = json.loads(msg.content)
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "video.mp4")
+            if not file_key:
+                return
+            video_path = await feishu.download_file(msg.message_id, file_key, file_name)
+            text = f"[用户发送了一个视频，文件名：{file_name}，已下载到路径：{video_path}，请告知用户你已收到视频文件]"
+            print(f"[视频] {file_name} → {video_path}", flush=True)
+        except Exception as e:
+            print(f"[error] 下载视频失败: {e}")
+            await _send_error(user_id, chat_id, is_group, msg.message_id, f"下载视频失败：{e}")
+            return
+
+    elif msg.message_type == "post":
+        try:
+            text, downloaded_files = await _parse_post_message(msg)
+            if not text and not downloaded_files:
+                return
+            if downloaded_files:
+                file_desc = "\n".join(f"- {desc}: {path}" for desc, path in downloaded_files)
+                text = f"{text}\n\n[消息中包含以下附件，已下载到本地：\n{file_desc}\n请读取并处理这些文件，直接回复用中文]"
+            print(f"[富文本] {text[:80]}", flush=True)
+        except Exception as e:
+            print(f"[error] 解析富文本失败: {e}")
+            await _send_error(user_id, chat_id, is_group, msg.message_id, f"解析富文本失败：{e}")
+            return
+
+    elif msg.message_type == "sticker":
+        text = "[用户发送了一个表情包]"
+
+    elif msg.message_type in ("share_chat", "share_user"):
+        text = "[用户分享了一个聊天/联系人]"
+
+    elif msg.message_type == "merge_forward":
+        text = "[用户转发了合并消息，暂不支持解析合并转发内容]"
+
     else:
-        return  # 不支持的消息类型
+        text = f"[用户发送了一条 {msg.message_type} 类型的消息，当前暂不支持处理该类型]"
+        print(f"[未知类型] {msg.message_type}", flush=True)
 
     # ── 斜杠命令 ──────────────────────────────────────────────
     parsed = parse_command(text)
