@@ -168,11 +168,13 @@ async def run_claude(
                             await _fire_callback(on_tool_use, pending_tool_name, {})
 
                     elif evt_type == "content_block_stop":
-                        if pending_tool_name and pending_tool_input_json:
-                            try:
-                                inp = json.loads(pending_tool_input_json)
-                            except json.JSONDecodeError:
-                                inp = {}
+                        if pending_tool_name:
+                            inp = {}
+                            if pending_tool_input_json:
+                                try:
+                                    inp = json.loads(pending_tool_input_json)
+                                except json.JSONDecodeError:
+                                    pass
                             await _fire_callback(on_tool_use, pending_tool_name, inp)
                         pending_tool_name = ""
                         pending_tool_input_json = ""
