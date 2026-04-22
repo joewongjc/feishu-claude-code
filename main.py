@@ -285,7 +285,15 @@ async def _run_and_display(
         if push_failures >= 3:
             return
         try:
-            await feishu.update_card(card_msg_id, content)
+            if ask_options:
+                buttons = [
+                    {"text": display, "value": {"reply": value, "cid": chat_id}}
+                    for display, value in ask_options
+                ]
+                short = all(len(b["text"]) <= 10 for b in buttons)
+                await feishu.update_card_with_buttons(card_msg_id, content, buttons, flow=short)
+            else:
+                await feishu.update_card(card_msg_id, content)
             push_failures = 0
         except Exception as push_err:
             push_failures += 1
@@ -323,15 +331,41 @@ async def _run_and_display(
             print(f"[Worktree] 退出 worktree", flush=True)
             return
         if name.lower() == "askuserquestion":
-            question = inp.get("question", inp.get("text", ""))
-            if question:
-                accumulated += f"\n\n❓ **等待回复：**\n{question}"
-                detected = _extract_options(question)
-                if detected:
+            questions = inp.get("questions", [])
+            if questions:
+                parts = []
+                opts = []
+                multi = len(questions) > 1
+                for q in questions:
+                    header = q.get("header", "")
+                    qtext = q.get("question", "")
+                    if header:
+                        parts.append(f"**{header}**: {qtext}" if qtext else f"**{header}**")
+                    elif qtext:
+                        parts.append(qtext)
+                    for opt in q.get("options", []):
+                        label = opt.get("label", "")
+                        desc = opt.get("description", "")
+                        if label:
+                            btn_text = f"[{header}] {label}" if multi and header else label
+                            opts.append((btn_text, btn_text))
+                            if desc:
+                                parts.append(f"  • **{label}** — {desc}")
+                if parts:
+                    accumulated += "\n\n❓ **等待回复：**\n" + "\n".join(parts)
+                if opts:
                     ask_options.clear()
-                    ask_options.extend(detected)
-                await push(_build_display())
-                return
+                    ask_options.extend(opts)
+            else:
+                question = inp.get("question", inp.get("text", ""))
+                if question:
+                    accumulated += f"\n\n❓ **等待回复：**\n{question}"
+                    detected = _extract_options(question)
+                    if detected:
+                        ask_options.clear()
+                        ask_options.extend(detected)
+            await push(_build_display())
+            return
         tool_line = _format_tool(name, inp)
         if inp and tool_history:
             tool_history[-1] = tool_line
